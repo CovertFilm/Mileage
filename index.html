@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#2563eb">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Mileage</title>
+<style>
+:root{--bg:#f7f8fa;--fg:#111827;--mut:#6b7280;--card:#fff;--line:#e5e7eb;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#b45309}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#f3f4f6;--mut:#9ca3af;--card:#1b1e25;--line:#2a2f3a;--acc:#60a5fa;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.4 system-ui,-apple-system,Roboto,sans-serif}
+main{max-width:520px;margin:0 auto;padding:max(20px,env(safe-area-inset-top)) 18px 40px}
+h1{font-size:22px;margin:6px 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px 20px;text-align:center;margin-bottom:14px}
+.card .big{font-size:46px;font-weight:700;line-height:1.1}
+.card.start .big{font-size:32px;color:var(--ok)}
+.card .sub{margin-top:8px;color:var(--mut);font-size:15px;word-break:break-word}
+.card.err .big{font-size:26px;color:var(--bad)}
+.card.warn .big{font-size:26px;color:var(--warn)}
+button,a.btn{display:block;width:100%;font:inherit;font-weight:600;text-align:center;text-decoration:none;border:0;border-radius:14px;padding:15px 14px;margin-top:10px;background:var(--card);color:var(--fg);border:1px solid var(--line)}
+button.pri,a.btn.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+button:disabled{opacity:.5}
+label{display:block;font-size:13px;color:var(--mut);margin:14px 0 4px}
+input{width:100%;font:inherit;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.mut{color:var(--mut);font-size:14px}
+.spin{width:34px;height:34px;border:4px solid var(--line);border-top-color:var(--acc);border-radius:50%;margin:0 auto 14px;animation:s 0.9s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.msg{font-size:14px;margin-top:8px}
+.msg.good{color:var(--ok)}.msg.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<main id="app"><div class="card"><div class="spin"></div><div class="sub">Loading…</div></div></main>
+<noscript>This page needs JavaScript.</noscript>
+<script>
+(function () {
+  'use strict';
+
+  var app = document.getElementById('app');
+  var LS = window.localStorage;
+  function load(k, d) { try { var v = LS.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } }
+  function save(k, v) { try { LS.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function $(id) { return document.getElementById(id); }
+
+  var cfg = load('mt_cfg', null);          // { url, key }
+  var queue = load('mt_queue', []);        // [{ q, n }]
+  var lastError = '';
+  var current = '';                        // name of the view on screen
+  var pendingScan = false;                 // came from the tag but still needs setup
+
+  function saveQueue() { save('mt_queue', queue); }
+  function cleanUrl(u) { return String(u || '').trim().split('#')[0].split('?')[0]; }
+  function urlProblem(u) {
+    if (!/^(https:\/\/script\.google\.com\/|http:\/\/localhost[:\/])/.test(u)) return 'That should start with https://script.google.com/';
+    if (/\/dev$/.test(u)) return 'That is the /dev test URL. You need the one ending in /exec (Deploy → Manage deployments).';
+    if (!/\/exec$/.test(u)) return 'The URL must end in /exec.';
+    return '';
+  }
+
+  // ───────── Network ─────────
+  function fetchText(url) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 30000);
+    return fetch(url, { redirect: 'follow', signal: ctl.signal, cache: 'no-store' }).then(
+      function (r) { clearTimeout(timer); if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); },
+      function (e) { clearTimeout(timer); throw e; }
+    );
+  }
+
+  // Fallback if the browser refuses the cross-site fetch: load the reply as a script (JSONP).
+  // Safe to repeat: scans carry a unique id and round-trip is idempotent on the server.
+  function jsonp(url) {
+    return new Promise(function (resolve, reject) {
+      var name = 'mt_cb_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      var s = document.createElement('script');
+      function cleanup() { clearTimeout(timer); try { delete window[name]; } catch (e) { window[name] = undefined; } if (s.parentNode) s.parentNode.removeChild(s); }
+      var timer = setTimeout(function () { cleanup(); reject(new Error('timeout')); }, 30000);
+      window[name] = function (txt) { cleanup(); resolve(txt); };
+      s.onerror = function () { cleanup(); reject(new Error('network')); };
+      s.src = url + '&callback=' + name;
+      document.head.appendChild(s);
+    });
+  }
+
+  function api(query, c) {
+    c = c || cfg;
+    var url = c.url + '?' + query + '&k=' + encodeURIComponent(c.key);
+    return fetchText(url).catch(function () { return jsonp(url); });
+  }
+
+  // Server reply format: event|miles|message|editUrl|tripId   or   error|message   or   ok|pong
+  function parse(text) {
+    var p = String(text).split('|');
+    if (p[0] === 'error') return { error: p.slice(1).join('|') || 'Unknown error' };
+    if (p[0] === 'ok') return { ok: true };
+    if ((p[0] === 'start' || p[0] === 'end') && p.length >= 5) {
+      return { event: p[0], miles: p[1], msg: p[2], editUrl: p[3], id: p[4] };
+    }
+    return { error: 'Unexpected reply from the server. Is the web app set to "Anyone"?' };
+  }
+
+  // Sends queued requests in order. Network failure keeps them for later; repeated server errors drop them.
+  var flushP = null;
+  function flush(onResult) {
+    if (flushP) { return flushP.then(function () { return flush(onResult); }); }
+    flushP = runFlush(onResult).then(function (s) { flushP = null; return s; }, function (e) { flushP = null; throw e; });
+    return flushP;
+  }
+  async function runFlush(onResult) {
+    var dropped = false;
+    while (queue.length) {
+      var item = queue[0], text;
+      try { text = await api(item.q); } catch (e) { return 'offline'; }
+      var r = parse(text);
+      if (r.error) {
+        lastError = r.error;
+        if (/unauthorized/i.test(r.error)) return 'auth';
+        item.n = (item.n || 0) + 1;
+        if (item.n >= 3) { queue.shift(); saveQueue(); dropped = true; continue; }
+        saveQueue();
+        return 'error';
+      }
+      queue.shift(); saveQueue();
+      if (r.event) { save('mt_last', { r: r, at: Date.now() }); if (onResult) onResult(r); }
+    }
+    return dropped ? 'error' : 'ok';
+  }
+
+  function sendQueue() {
+    return flush(showResult).then(function (st) {
+      if (st === 'offline') showOffline();
+      else if (st === 'auth') showProblem('Key rejected', 'The server did not accept your key. Re-enter it in Settings.', true);
+      else if (st === 'error') showProblem('Server error', lastError, false);
+    });
+  }
+
+  // ───────── Location ─────────
+  function getPos() {
+    return new Promise(function (resolve, reject) {
+      if (!navigator.geolocation) return reject({ code: 0 });
+      navigator.geolocation.getCurrentPosition(resolve, function (err) {
+        if (err && err.code === 1) return reject(err);
+        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 });
+      }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 });
+    });
+  }
+
+  // ───────── Actions ─────────
+  function newRid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+  function scan() {
+    var t = Date.now();
+    if (t - load('mt_lastscan', 0) < 8000) { return home('That scan was already handled a moment ago.'); }
+    save('mt_lastscan', t);
+    working('Getting your location…');
+    getPos().then(function (pos) {
+      var q = 'action=scan&t=' + t + '&lat=' + pos.coords.latitude.toFixed(6) + '&lng=' + pos.coords.longitude.toFixed(6) + '&rid=' + newRid();
+      queue.push({ q: q }); saveQueue();
+      working('Logging trip…');
+      return sendQueue();
+    }, function (err) {
+      save('mt_lastscan', 0);
+      var denied = err && err.code === 1;
+      showProblem(denied ? 'Location is blocked' : 'No GPS fix',
+        denied ? 'Allow location for this site in Chrome (lock icon → Permissions), then try again.' : 'Could not get a location. Try again, ideally with a clear view of the sky.', false, true);
+    });
+  }
+
+  function roundTrip(r, on) {
+    var b = $('rt'); if (b) { b.disabled = true; b.textContent = 'Saving…'; }
+    queue.push({ q: 'action=roundtrip&id=' + encodeURIComponent(r.id) + '&on=' + (on ? 1 : 0) }); saveQueue();
+    sendQueue();
+  }
+
+  // ───────── Views ─────────
+  function view(name, html) { current = name; app.innerHTML = html; }
+
+  function working(text) {
+    view('working', '<div class="card"><div class="spin"></div><div class="sub">' + esc(text) + '</div></div>');
+  }
+
+  function showResult(r) {
+    var isStart = r.event === 'start';
+    var rt = /^Round trip/.test(r.msg);
+    var warn = /Looks off/.test(r.msg);
+    var sub = isStart ? r.msg.replace(/^Trip started\s*/, '') : (rt ? 'Round trip logged' : (warn ? 'Trip logged. That looks too short, check the miles.' : 'Trip logged'));
+    var h = '<div class="card ' + (isStart ? 'start' : (warn ? 'warn' : 'end')) + '">' +
+      '<div class="big">' + (isStart ? 'Trip started' : esc(r.miles) + ' mi') + '</div>' +
+      '<div class="sub">' + esc(sub) + '</div></div>';
+    if (!isStart) h += '<button class="pri" id="rt">' + (rt ? 'Undo round trip' : 'Log as round trip ×2') + '</button>';
+    h += '<a class="btn" id="edit" target="_blank" rel="noopener" href="' + esc(r.editUrl) + '">Edit trip</a>';
+    h += '<button id="done">Done</button>';
+    view('result', h);
+    if (!isStart) $('rt').onclick = function () { roundTrip(r, !rt); };
+    $('done').onclick = function () { window.close(); setTimeout(function () { home(); }, 250); };
+    try { if (navigator.vibrate) navigator.vibrate(40); } catch (e) {}
+  }
+
+  function showOffline() {
+    view('offline', '<div class="card warn"><div class="big">Saved</div><div class="sub">No connection. This will sync automatically the next time you open this page with a connection.</div></div>' +
+      '<button id="done">Done</button>');
+    $('done').onclick = function () { window.close(); setTimeout(function () { home(); }, 250); };
+  }
+
+  function showProblem(title, text, toSettings, retryScan) {
+    var h = '<div class="card err"><div class="big">' + esc(title) + '</div><div class="sub">' + esc(text) + '</div></div>';
+    if (retryScan) h += '<button class="pri" id="retry">Try again</button>';
+    if (toSettings) h += '<button class="pri" id="gs">Open settings</button>';
+    h += '<button id="home">Home</button>';
+    view('problem', h);
+    if (retryScan) $('retry').onclick = scan;
+    if (toSettings) $('gs').onclick = function () { settings(); };
+    $('home').onclick = function () { home(); };
+  }
+
+  function ago(ms) {
+    var m = Math.round((Date.now() - ms) / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + ' min ago';
+    var h = Math.round(m / 60);
+    if (h < 24) return h + ' h ago';
+    return Math.round(h / 24) + ' d ago';
+  }
+
+  function home(note) {
+    var last = load('mt_last', null);
+    var h = '<h1>Mileage</h1>';
+    if (note) h += '<p class="mut">' + esc(note) + '</p>';
+    if (last && last.r) {
+      var r = last.r;
+      h += '<div class="card ' + (r.event === 'start' ? 'start' : 'end') + '"><div class="mut">Last: ' + esc(ago(last.at)) + '</div>' +
+        '<div class="big">' + (r.event === 'start' ? 'Trip open' : esc(r.miles) + ' mi') + '</div>' +
+        '<div class="sub">' + esc(r.msg.replace(/\s*Tap to edit\.$/, '')) + '</div></div>';
+    }
+    h += '<button class="pri" id="go">Start / end a trip now</button>';
+    h += '<p class="mut" style="margin:6px 4px 0">Same as tapping the tag. Handy for testing.</p>';
+    h += '<a class="btn" target="_blank" rel="noopener" href="' + esc(cfg.url + '?k=' + encodeURIComponent(cfg.key)) + '">Trip list &amp; manual entry</a>';
+    if (queue.length) h += '<div class="card warn" style="margin-top:14px"><div class="sub">' + queue.length + ' item(s) waiting to sync.</div><button id="sync">Sync now</button></div>';
+    h += '<button id="set">Settings</button>';
+    view('home', h);
+    $('go').onclick = scan;
+    $('set').onclick = function () { settings(); };
+    if ($('sync')) $('sync').onclick = function () { working('Syncing…'); sendQueue().then(function () { if (current !== 'result') home(); }); };
+  }
+
+  function settings(msg, good) {
+    var h = '<h1>Settings</h1>' +
+      '<label>Web app URL (ends in /exec)</label><input id="u" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" value="' + esc(cfg ? cfg.url : '') + '">' +
+      '<label>Key (MT_KEY)</label><input id="k" autocapitalize="off" autocorrect="off" spellcheck="false" value="' + esc(cfg ? cfg.key : '') + '">' +
+      '<button class="pri" id="save">Save</button><button id="test">Test connection</button>' +
+      '<div class="msg ' + (good ? 'good' : 'bad') + '" id="m">' + esc(msg || '') + '</div>' +
+      (cfg ? '<button id="back">Back</button>' : '');
+    view('settings', h);
+    function read() {
+      var u = cleanUrl($('u').value), k = $('k').value.trim();
+      var p = urlProblem(u);
+      if (p) { setMsg(p, false); return null; }
+      if (!k) { setMsg('Enter your key.', false); return null; }
+      return { url: u, key: k };
+    }
+    function setMsg(t, ok) { var m = $('m'); m.textContent = t; m.className = 'msg ' + (ok ? 'good' : 'bad'); }
+    $('save').onclick = function () {
+      var c = read(); if (!c) return;
+      cfg = c; save('mt_cfg', cfg);
+      if (pendingScan) { pendingScan = false; scan(); } else { home(); }
+    };
+    $('test').onclick = function () {
+      var c = read(); if (!c) return;
+      setMsg('Testing…', true);
+      api('action=ping', c).then(function (t) {
+        var r = parse(t);
+        if (r.ok) setMsg('Connected ✓', true); else setMsg(r.error || 'Unexpected reply', false);
+      }, function () { setMsg('Could not reach the server. Check the URL and your connection.', false); });
+    };
+    if ($('back')) $('back').onclick = function () { home(); };
+  }
+
+  // ───────── Boot ─────────
+  (function boot() {
+    // Optional one-time setup link:  page#e=<exec url>&k=<key>
+    var hash = location.hash.replace(/^#/, '');
+    if (hash) {
+      try {
+        var hp = new URLSearchParams(hash);
+        if (hp.get('e') && hp.get('k')) { cfg = { url: cleanUrl(hp.get('e')), key: hp.get('k') }; save('mt_cfg', cfg); }
+      } catch (e) {}
+    }
+    var wantScan = /[?&]scan=1(&|$)/.test(location.search);
+    // Strip ?scan=1 right away so a reload or tab restore can never log a second scan.
+    if (wantScan || hash) { try { history.replaceState(null, '', location.pathname); } catch (e) {} }
+
+    if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(function () {}); }
+
+    if (!cfg) { pendingScan = wantScan; return settings(wantScan ? 'First time here: paste your URL and key, then your scan will run.' : ''); }
+    if (wantScan) { return scan(); }
+    home();
+    if (queue.length) { flush().then(function () { if (current === 'home') home(); }); }
+  })();
+
+  window.addEventListener('online', function () {
+    if (cfg && queue.length && (current === 'home' || current === 'offline')) {
+      flush(showResult).then(function () { if (current === 'home') home(); });
+    }
+  });
+})();
+</script>
+</body>
+</html>
